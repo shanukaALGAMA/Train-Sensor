@@ -28,17 +28,42 @@ const float SENS = 0.300;
 const float G_TO_MS2 = 9.80665;
 
 // ======================
-// SLIDING WINDOW BUFFERS (4 SENSORS)
+// SLIDING WINDOW BUFFERS (8 SENSORS)
 // ======================
-float buffer[4][WINDOW_SIZE];
+float buffer[8][WINDOW_SIZE];
 int bufIndex = 0;
 bool bufferFilled = false;
 
 unsigned long lastSampleMicros = 0;
 
 
-bool alertArmed[4] = {true, true, true, true};  // ✅ One-shot trigger per sensor
-unsigned long lastAlertTime[4] = {0, 0, 0, 0};  // ✅ Cooldown timer
+bool alertArmed[8] = {true, true, true, true, true, true, true, true};  // ✅ One-shot trigger per sensor
+unsigned long lastAlertTime[8] = {0, 0, 0, 0, 0, 0, 0, 0};  // ✅ Cooldown timer
+
+// ======================
+// MIDDLE STATE MACHINE
+// ======================
+
+enum MiddleState {
+  MIDDLE_CLEAR,
+  MIDDLE_APPROACHING,
+  MIDDLE_OCCUPIED
+};
+
+MiddleState currentMiddleState = MIDDLE_CLEAR;
+
+// Track last sensor that triggered
+int lastTriggeredSensor = -1;
+
+// Exit logic variables
+enum ExitDirection { NONE, LEFT_EXIT, RIGHT_EXIT };
+ExitDirection exitDirection = NONE;
+int maxExitIndex = 0;
+
+// Approach tracking
+int lastLeftDistance  = 99;
+int lastRightDistance = 99;
+
 
 // ======================
 // SETUP
@@ -64,7 +89,7 @@ void setup() {
   ads1.setGain(GAIN_ONE);
   ads2.setGain(GAIN_ONE);
 
-  Serial.println("✅ 4-Sensor Real-Time RMS + Peak Engine Ready");
+  Serial.println("✅ 8-Sensor Real-Time RMS + Peak Engine Ready");
 }
 
 // ======================
@@ -75,16 +100,20 @@ void loop() {
     lastSampleMicros += SAMPLE_PERIOD_US;
 
     // ===========================
-    // READ 4 Z-AXIS CHANNELS
+    // READ 8 Z-AXIS CHANNELS
     // ===========================
-    int16_t raw[4];
+    int16_t raw[8];
 
-    raw[0] = ads1.readADC_SingleEnded(1);  // S1_Z
-    raw[1] = ads1.readADC_SingleEnded(3);  // S2_Z
-    raw[2] = ads2.readADC_SingleEnded(1);  // S3_Z
-    raw[3] = ads2.readADC_SingleEnded(3);  // S4_Z
+    raw[0] = ads1.readADC_SingleEnded(0);  // S1_Z
+    raw[1] = ads1.readADC_SingleEnded(1);  // S2_Z
+    raw[2] = ads1.readADC_SingleEnded(2);  // S3_Z
+    raw[3] = ads1.readADC_SingleEnded(3);  // S4_Z
+    raw[4] = ads2.readADC_SingleEnded(0);  // S1_Z
+    raw[5] = ads2.readADC_SingleEnded(1);  // S2_Z
+    raw[6] = ads2.readADC_SingleEnded(2);  // S3_Z
+    raw[7] = ads2.readADC_SingleEnded(3);  // S4_Z
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 8; i++) {
       float voltage = raw[i] * VREF / ADC_MAX;
       float accel_g = (voltage - ZERO_G) / SENS;
       float accel = accel_g * G_TO_MS2;
@@ -104,36 +133,145 @@ void loop() {
   }
 }
 
+void updateMiddleLogic(int currentSensor) {
+  if (lastTriggeredSensor == -1) {
+    lastTriggeredSensor = currentSensor;
+    return;
+  }
 
-void sendAlertToServer(int sensorID, float peakVal) {
+  // ✅ NEW RULE: If already approaching and middle sensor hits → OCCUPIED
+  if (currentMiddleState == MIDDLE_APPROACHING &&
+      (currentSensor == 4 || currentSensor == 5)) {
+
+      currentMiddleState = MIDDLE_OCCUPIED;
+      exitDirection = NONE;
+      maxExitIndex = 0;
+      lastTriggeredSensor = currentSensor;
+      return;  // ✅ Stop further processing immediately
+  }
+
+  // ======================
+  // ✅ 1. DETECT MIDDLE ENTRY
+  // ======================
+  if ((lastTriggeredSensor == 4 && currentSensor == 5) ||
+      (lastTriggeredSensor == 5 && currentSensor == 4)) {
+    currentMiddleState = MIDDLE_OCCUPIED;
+    exitDirection = NONE;
+    maxExitIndex = 0;
+  }
+
+  // ======================
+  // ✅ 2. EXIT LOGIC (WITH JITTER)
+  // ======================
+  if (currentMiddleState == MIDDLE_OCCUPIED) {
+
+    // ---- EXIT RIGHT: 5 → 6 → 7 → 8 ----
+    if (exitDirection == NONE && currentSensor == 6) {
+      exitDirection = RIGHT_EXIT;
+      maxExitIndex = 1;
+    }
+
+    if (exitDirection == RIGHT_EXIT) {
+      if (currentSensor == 6) maxExitIndex = max(maxExitIndex, 1);
+      if (currentSensor == 7) maxExitIndex = max(maxExitIndex, 2);
+
+      if (currentSensor == 8 && maxExitIndex >= 2) {
+        currentMiddleState = MIDDLE_CLEAR;
+        exitDirection = NONE;
+        maxExitIndex = 0;
+        lastLeftDistance = 99;
+        lastRightDistance = 99;
+      }
+    }
+
+    // ---- EXIT LEFT: 4 → 3 → 2 → 1 ----
+    if (exitDirection == NONE && currentSensor == 3) {
+      exitDirection = LEFT_EXIT;
+      maxExitIndex = 1;
+    }
+
+    if (exitDirection == LEFT_EXIT) {
+      if (currentSensor == 3) maxExitIndex = max(maxExitIndex, 1);
+      if (currentSensor == 2) maxExitIndex = max(maxExitIndex, 2);
+
+      if (currentSensor == 1 && maxExitIndex >= 2) {
+        currentMiddleState = MIDDLE_CLEAR;
+        exitDirection = NONE;
+        maxExitIndex = 0;
+        lastLeftDistance = 99;
+        lastRightDistance = 99;
+      }
+    }
+
+    lastTriggeredSensor = currentSensor;
+    return;  // ✅ OCCUPIED always has priority
+  }
+
+  // ======================
+  // ✅ 3. APPROACH DETECTION
+  // ======================
+
+  int distanceToMiddleLeft  = (currentSensor <= 4) ? (5 - currentSensor) : 99;
+  int distanceToMiddleRight = (currentSensor >= 5) ? (currentSensor - 4) : 99;
+
+  bool approaching = false;
+
+  if (currentSensor <= 4) {  // LEFT SIDE
+    if (distanceToMiddleLeft < lastLeftDistance) approaching = true;
+    lastLeftDistance = distanceToMiddleLeft;
+  }
+
+  if (currentSensor >= 5) {  // RIGHT SIDE
+    if (distanceToMiddleRight < lastRightDistance) approaching = true;
+    lastRightDistance = distanceToMiddleRight;
+  }
+
+  if (approaching) {
+    currentMiddleState = MIDDLE_APPROACHING;
+  } else {
+    currentMiddleState = MIDDLE_CLEAR;
+  }
+
+  lastTriggeredSensor = currentSensor;
+}
+
+
+void sendStateToServer() {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
     http.begin(serverURL);
     http.addHeader("Content-Type", "application/json");
 
+    String stateStr = "CLEAR";
+
+    if (currentMiddleState == MIDDLE_OCCUPIED)
+      stateStr = "OCCUPIED";
+    else if (currentMiddleState == MIDDLE_APPROACHING)
+      stateStr = "APPROACHING";
+
     String payload = "{";
-    payload += "\"sensor\": " + String(sensorID);
-    payload += ", \"peak\": " + String(peakVal, 3);
+    payload += "\"state\": \"" + stateStr + "\"";
     payload += "}";
 
     int httpResponseCode = http.POST(payload);
 
     if (httpResponseCode > 0) {
-      Serial.println("✅ Alert sent to server");
+      Serial.println("✅ State sent: " + stateStr);
     } else {
-      Serial.println("❌ Failed to send alert");
+      Serial.println("❌ Failed to send state");
     }
 
     http.end();
   }
 }
 
+
 // ===========================
 // FAST RMS + PEAK CALCULATION
 // ===========================
 void computeVibration() {
-  static float rmsOut[4] = {0};
-  static float peakOut[4] = {0};
+  static float rmsOut[8] = {0};
+  static float peakOut[8] = {0};
 
   const float ALPHA = 0.2;
 
@@ -141,7 +279,7 @@ void computeVibration() {
   const float RESET_THRESHOLD = 1.0;  // ✅ Must fall below this to re-arm
   const unsigned long ALERT_COOLDOWN = 1000; // ✅ 1 second minimum between alerts
 
-  for (int s = 0; s < 4; s++) {
+  for (int s = 0; s < 8; s++) {
     float sumSq = 0;
     float maxVal = 0;
 
@@ -170,7 +308,8 @@ void computeVibration() {
         alertArmed[s] == true &&
         now - lastAlertTime[s] > ALERT_COOLDOWN) {
 
-      sendAlertToServer(s + 1, peakOut[s]);
+      updateMiddleLogic(s + 1);
+      sendStateToServer();
 
       alertArmed[s] = false;      // 🔒 Lock until vibration ends
       lastAlertTime[s] = now;    // 🕒 Store time
@@ -186,14 +325,20 @@ void computeVibration() {
     "S1 RMS: %.3f | P: %.3f || "
     "S2 RMS: %.3f | P: %.3f || "
     "S3 RMS: %.3f | P: %.3f || "
-    "S4 RMS: %.3f | P: %.3f\n",
+    "S4 RMS: %.3f | P: %.3f || "
+    "S5 RMS: %.3f | P: %.3f || "
+    "S6 RMS: %.3f | P: %.3f || "
+    "S7 RMS: %.3f | P: %.3f || "
+    "S8 RMS: %.3f | P: %.3f\n",
     rmsOut[0], peakOut[0],
     rmsOut[1], peakOut[1],
     rmsOut[2], peakOut[2],
-    rmsOut[3], peakOut[3]
+    rmsOut[3], peakOut[3],
+    rmsOut[4], peakOut[4],
+    rmsOut[5], peakOut[5],
+    rmsOut[6], peakOut[6],
+    rmsOut[7], peakOut[7]
   );
 }
-
-
 
 
