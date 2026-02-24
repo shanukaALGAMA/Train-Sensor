@@ -2,13 +2,25 @@
 #include <Adafruit_ADS1X15.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
 
 
 const char* ssid = "Galaxy A05 AL";
 const char* password = "whywifi1";
 
-// PC IP ADDRESS
-const char* serverURL = "http://10.22.68.50:3000/alert";
+// PC IP ADDRESS (sensor server)
+const char* serverURL = "http://10.236.80.50:3000/alert";
+
+// SENSOR IDENTIFIER
+const char* DEVICE_CODE = "ZONE_1";
+
+// RELAY PINS
+#define RELAY_ALARM_PIN 25
+#define RELAY_BRAKE_PIN 26
+
+// Web server for direct app commands (port 80)
+WebServer cmdServer(80);
 
 Adafruit_ADS1115 ads1;   // 0x48
 Adafruit_ADS1115 ads2;   // 0x49
@@ -66,10 +78,58 @@ int lastRightDistance = 99;
 
 
 // ======================
+// COMMAND HANDLER (called by WebServer)
+// ======================
+void handleCommand() {
+  if (cmdServer.method() != HTTP_POST) {
+    cmdServer.send(405, "application/json", "{\"error\":\"Method not allowed\"}");
+    return;
+  }
+
+  String body = cmdServer.arg("plain");
+  StaticJsonDocument<128> doc;
+  DeserializationError err = deserializeJson(doc, body);
+
+  if (err) {
+    cmdServer.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+    return;
+  }
+
+  const char* device = doc["device"];
+  const char* state  = doc["state"];
+
+  if (!device || !state) {
+    cmdServer.send(400, "application/json", "{\"error\":\"Missing device or state\"}");
+    return;
+  }
+
+  bool isOn = String(state) == "ON";
+
+  if (String(device) == "ALARM") {
+    digitalWrite(RELAY_ALARM_PIN, isOn ? HIGH : LOW);
+    Serial.printf(" ALARM relay -> %s\n", state);
+  } else if (String(device) == "BRAKE") {
+    digitalWrite(RELAY_BRAKE_PIN, isOn ? HIGH : LOW);
+    Serial.printf(" BRAKE relay -> %s\n", state);
+  } else {
+    cmdServer.send(400, "application/json", "{\"error\":\"Unknown device\"}");
+    return;
+  }
+
+  cmdServer.send(200, "application/json", "{\"status\":\"OK\"}");
+}
+
+// ======================
 // SETUP
 // ======================
 void setup() {
   Serial.begin(115200);
+
+  // Relay outputs
+  pinMode(RELAY_ALARM_PIN, OUTPUT);
+  pinMode(RELAY_BRAKE_PIN, OUTPUT);
+  digitalWrite(RELAY_ALARM_PIN, LOW);
+  digitalWrite(RELAY_BRAKE_PIN, LOW);
 
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
@@ -80,6 +140,13 @@ void setup() {
   }
 
   Serial.println("\n WiFi Connected!");
+  Serial.print(" ESP32 IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Start command server
+  cmdServer.on("/command", HTTP_POST, handleCommand);
+  cmdServer.begin();
+  Serial.println(" Command server running on port 80");
 
   Wire.begin(21, 22);
 
@@ -96,6 +163,8 @@ void setup() {
 // LOOP
 // ======================
 void loop() {
+  cmdServer.handleClient(); // Handle incoming HTTP commands from app
+
   if (micros() - lastSampleMicros >= SAMPLE_PERIOD_US) {
     lastSampleMicros += SAMPLE_PERIOD_US;
 
@@ -250,6 +319,7 @@ void sendStateToServer() {
       stateStr = "APPROACHING";
 
     String payload = "{";
+    payload += "\"device_code\": \"" + String(DEVICE_CODE) + "\",";
     payload += "\"state\": \"" + stateStr + "\"";
     payload += "}";
 
