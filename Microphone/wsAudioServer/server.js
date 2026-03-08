@@ -2,6 +2,7 @@ const path = require("path");
 const express = require("express");
 const WebSocket = require("ws");
 const fs = require("fs");
+const http = require("http");
 
 const app = express();
 
@@ -54,11 +55,36 @@ wsServer.on("connection", (ws) => {
     // other clients as text. Return early so they are never treated as audio.
     if (message.startsWith("ALERT:")) {
       console.log("Alert received:", message);
+
+      // Broadcast to browser clients
       connectedClients.forEach((client) => {
         if (client !== ws && client.readyState === client.OPEN) {
           client.send(message);
         }
       });
+
+      // POST to main DB sensor server
+      const [_prefix, alertType] = message.split(":");
+      const postData = JSON.stringify({ type: alertType });
+
+      const req = http.request({
+        hostname: 'localhost',
+        port: 3000,
+        path: '/audio-alert',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(postData)
+        }
+      }, (res) => {
+        // silently handle response
+      });
+      req.on('error', (e) => {
+        console.error("Failed to proxy alert to sensor-server 3000: ", e.message);
+      });
+      req.write(postData);
+      req.end();
+
       return;
     }
 

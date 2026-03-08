@@ -99,7 +99,7 @@ async def detect():
             # Calculate composite score (sum of target classes)
             target_score = sum(mean_scores[i] for i in signature_indices)
             
-            # Calculate anti-score (sum of human speech, fans, engines)
+            # Calculate anti-score (sum of human speech, fans, vehicles)
             noise_score = sum(mean_scores[i] for i in anti_signature_indices)
             
             # Final signature = targets MINUS background noise
@@ -107,15 +107,18 @@ async def detect():
             
             # Keep it between 0.0 and 1.0 (0% - 100%)
             composite_score = max(0.0, min(composite_score, 1.0))
-
             
             top_class = class_names[int(np.argmax(mean_scores))].title()
 
-            print(f"Top class: {top_class:<35} | Elephant Signature: {composite_score:.3f}")
+            print(f"Top class: {top_class:<35} | Elephant: {composite_score:.3f} | Vehicle/Speech: {noise_score:.3f}")
 
+            # TRUTH CONDITIONS
             if composite_score >= DETECTION_THRESHOLD:
                 print(f"🐘 ELEPHANT DETECTED! Signature Match: {composite_score:.1%}")
                 await ws.send(f"ALERT:ELEPHANT_DETECTED:{composite_score:.3f}")
+            elif noise_score >= 0.3 and composite_score < 0.2:
+                print(f"🚗 VEHICLE/SPEECH DETECTED! Signature Match: {noise_score:.1%}")
+                await ws.send(f"ALERT:VEHICLE_DETECTED:{noise_score:.3f}")
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ const char *ssid = "Galaxy A05 AL";
 const char *password = "whywifi1";
 
 // PC IP ADDRESS
-const char *serverURL = "http://10.236.80.50:3000/alert";
+const char *serverURL = "http://10.81.223.50:3000/alert";
 
 // SENSOR IDENTIFIER
 const char *DEVICE_CODE = "ZONE_1";
