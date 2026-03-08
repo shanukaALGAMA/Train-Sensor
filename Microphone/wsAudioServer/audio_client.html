@@ -1,0 +1,272 @@
+<html>
+
+<head>
+    <title>Audio Stream Monitor</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href='http://fonts.googleapis.com/css?family=Roboto' rel='stylesheet' type='text/css'>
+    <link rel="icon" href="image/favicon.ico" type="image/x-icon">
+    <script src="https://cdn.jsdelivr.net/npm/darkmode-js@1.5.7/lib/darkmode-js.min.js"></script>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js" charset="utf-8"></script>
+    <script src="https://unpkg.com/pcm-player"></script>
+</head>
+<style>
+    body {
+        font-family: 'Roboto', sans-serif;
+    }
+
+    .button {
+        border: none;
+        padding: 15px 32px;
+        text-align: center;
+        text-decoration: none;
+        display: inline-block;
+        font-size: 16px;
+        margin: 4px 2px;
+        cursor: pointer;
+    }
+
+    /* Elephant detection alert banner */
+    #elephantAlert {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        background: linear-gradient(90deg, #b8001e, #ff4c00);
+        color: white;
+        font-size: 1.2rem;
+        font-weight: bold;
+        text-align: center;
+        padding: 16px;
+        z-index: 999;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+        animation: slideDown 0.3s ease;
+    }
+
+    @keyframes slideDown {
+        from {
+            transform: translateY(-100%);
+        }
+
+        to {
+            transform: translateY(0);
+        }
+    }
+</style>
+
+<body>
+    <h1>Live Audio Monitor</h1>
+    <p>Connect to WebSocket by pressing the [Connect] button first!</p>
+    <button id="connectBtn" class="button" onclick="connect()">Connect</button>
+    <input type="range" max="1" value="0.5" min="0" id="range" onchange="changeVolume(event)" step="0.1"><br />
+    <button id="pauseBtn" class="button" onclick="pause()">Pause Playing</button>
+    <button id="continueBtn" class="button" onclick="resumePlay()">Continue Playing</button>
+    <button id="recordBtn" class="button" onclick="toggleRecord()">Start Recording</button>
+    <button id="serverRecordBtn" class="button" onclick="toggleServerRecord()">Start Server Recording</button>
+    <!-- Elephant detection alert banner (shown when Python detector fires) -->
+    <div id="elephantAlert"></div>
+    <div id="graph"></div>
+    <script>
+
+        // Initialise dark mode toggle widget
+        function addDarkmodeWidget() {
+            new Darkmode().showWidget();
+        }
+        window.addEventListener('load', addDarkmodeWidget);
+
+        var connectBtn = document.getElementById("connectBtn");
+        var pauseBtn = document.getElementById("pauseBtn");
+        var continueBtn = document.getElementById("continueBtn");
+        connectBtn.disabled = false;
+        pauseBtn.disabled = true;
+        continueBtn.disabled = true;
+
+        // Web Worker processes incoming PCM chunks and returns an RMS level value for the graph
+        var worker = new Worker('js/worker.js')
+        worker.addEventListener('message', function (e) {
+
+            graphDataArray = graphDataArray.concat(e.data)
+            graphDataArray.splice(0, 1)
+
+            var data_update = {
+                y: [graphDataArray]
+            };
+
+            Plotly.update('graph', data_update)
+        }, false);
+
+        // Rolling array of 100 samples used to animate the waveform graph
+        const arrayLength = 100
+        var graphDataArray = []
+
+        for (var i = 0; i < arrayLength; i++) {
+            graphDataArray[i] = 0;
+        }
+
+        var layout = {
+            title: 'Streaming Data',
+            paper_bgcolor: "#000",
+            plot_bgcolor: "#000",
+            xaxis: {
+                domain: [0, 1],
+                showticklabels: false,
+                color: "#FFF",
+            },
+            yaxis: {
+                domain: [0, 1],
+                color: "#FFF",
+                rangemode: "auto",
+            },
+        }
+
+        Plotly.newPlot('graph', [{
+            y: graphDataArray,
+            mode: 'lines',
+            line: { color: '#DF56F1' }
+        }], layout);
+
+        let player;
+        let ws;
+        let isRecording = false;
+        let recordedBuffers = [];
+        let recordedLength = 0;
+        let isServerRecording = false;
+
+
+        // Opens a WebSocket connection to the server and starts the PCM player
+        window.connect = function connect() {
+
+            connectBtn.disabled = !connectBtn.disabled;
+            pauseBtn.disabled = !pauseBtn.disabled;
+
+            player = new PCMPlayer({
+                inputCodec: 'Int16',
+                channels: 1,
+                sampleRate: 44100,
+            });
+
+            const WS_URL = 'ws://localhost:8888'
+            ws = new WebSocket(WS_URL)
+            ws.binaryType = 'arraybuffer'
+
+            ws.addEventListener('message', function (event) {
+
+                // Text messages are alerts from the Python detector — not audio
+                if (typeof event.data === 'string') {
+                    if (event.data.startsWith('ALERT:ELEPHANT_DETECTED:')) {
+                        const score = parseFloat(event.data.split(':')[2]);
+                        showElephantAlert(score);
+                    }
+                    return;
+                }
+
+                // Binary path: feed raw PCM to the audio player
+                if (continueBtn.disabled) {
+                    player.feed(event.data);
+                    worker.postMessage(event.data);
+                }
+
+                // Collect PCM chunks into a buffer when client-side recording is active
+                if (isRecording) {
+                    let pcmChunk = new Int16Array(event.data);
+                    recordedBuffers.push(pcmChunk);
+                    recordedLength += pcmChunk.length;
+                }
+            });
+
+        }
+
+        window.changeVolume = function changeVolume(e) {
+            player.volume(document.querySelector('#range').value)
+        }
+
+        window.pause = async function pause() {
+            pauseBtn.disabled = true;
+            continueBtn.disabled = false;
+            await player.pause()
+        }
+
+        window.resumePlay = function resumePlay() {
+            player.continue()
+            pauseBtn.disabled = false;
+            continueBtn.disabled = true;
+        }
+
+        // Encodes collected PCM buffers into a WAV Blob for download
+        function encodeWAV(buffers, totalLength, sampleRate) {
+
+            const buffer = new ArrayBuffer(44 + totalLength * 2);
+            const view = new DataView(buffer);
+
+            function writeString(view, offset, string) {
+                for (let i = 0; i < string.length; i++) {
+                    view.setUint8(offset + i, string.charCodeAt(i));
+                }
+            }
+
+            // Write WAV header
+            writeString(view, 0, 'RIFF');
+            view.setUint32(4, 36 + totalLength * 2, true);
+            writeString(view, 8, 'WAVE');
+            writeString(view, 12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true);        // PCM format
+            view.setUint16(22, 1, true);        // Mono
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * 2, true);
+            view.setUint16(32, 2, true);
+            view.setUint16(34, 16, true);       // 16-bit
+            writeString(view, 36, 'data');
+            view.setUint32(40, totalLength * 2, true);
+
+            // Write interleaved PCM samples
+            let offset = 44;
+            for (let i = 0; i < buffers.length; i++) {
+                for (let j = 0; j < buffers[i].length; j++) {
+                    view.setInt16(offset, buffers[i][j], true);
+                    offset += 2;
+                }
+            }
+
+            return new Blob([view], { type: "audio/wav" });
+        }
+
+        // Sends START_RECORD / STOP_RECORD commands to the server to trigger server-side WAV saving
+        window.toggleServerRecord = function () {
+
+            const btn = document.getElementById("serverRecordBtn");
+
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert("WebSocket not connected!");
+                return;
+            }
+
+            if (!isServerRecording) {
+                ws.send("START_RECORD");
+                btn.innerText = "Stop Server Recording";
+                btn.style.background = "red";
+                isServerRecording = true;
+            }
+            else {
+                ws.send("STOP_RECORD");
+                btn.innerText = "Start Server Recording";
+                btn.style.background = "";
+                isServerRecording = false;
+            }
+        };
+
+        // Displays the elephant detection banner for 10 seconds then hides it
+        let alertTimeout;
+        function showElephantAlert(score) {
+            const el = document.getElementById('elephantAlert');
+            const pct = (score * 100).toFixed(1);
+            el.innerHTML = `🐘 Elephant Detected! &nbsp;|&nbsp; Confidence: <strong>${pct}%</strong> &nbsp;|&nbsp; ${new Date().toLocaleTimeString()}`;
+            el.style.display = 'block';
+            clearTimeout(alertTimeout);
+            alertTimeout = setTimeout(() => { el.style.display = 'none'; }, 10000);
+        }
+
+    </script>
+</body>
+
+</html>

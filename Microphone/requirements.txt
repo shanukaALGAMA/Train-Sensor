@@ -1,0 +1,6 @@
+setuptools==69.5.1
+websockets>=11.0
+numpy>=1.23
+scipy>=1.9
+tensorflow>=2.12
+tensorflow-hub>=0.13
